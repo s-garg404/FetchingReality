@@ -362,6 +362,7 @@ const raycasterPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0); // Ground
 const threeRay       = new THREE.Raycaster();
 const mouseVec       = new THREE.Vector2();
 const planeIntersect = new THREE.Vector3();
+const pointerTarget  = new THREE.Vector3();
 
 let isDraggingBall = false;
 let pointerDownPos = new THREE.Vector2();
@@ -710,8 +711,12 @@ function updatePointerRay(e) {
   mouseVec.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
   mouseVec.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
 
-  threeRay.setFromCamera(mouseVec, camera3D);
+  const projected = new THREE.Vector3(mouseVec.x, mouseVec.y, 0).unproject(camera3D);
+  const direction = projected.sub(camera3D.position).normalize();
+
+  threeRay.set(camera3D.position.clone(), direction);
   threeRay.ray.intersectPlane(raycasterPlane, planeIntersect);
+  pointerTarget.copy(planeIntersect);
 
   // Update 2D SDF mouse uniforms
   mouseSDF.x = (e.clientX - rect.left) / rect.width;
@@ -962,7 +967,18 @@ function updateStateMachine(dt, time) {
         const idleWobble = Math.sin(time * 3.2) * 0.08;
         const breathingBob = Math.sin(time * 6.5) * 0.02;
 
-        dogRoot.rotation.y = THREE.MathUtils.lerp(dogRoot.rotation.y, idleWobble, 0.1);
+        if (planeIntersect && planeIntersect.lengthSq() > 0) {
+          const dx = pointerTarget.x - dogRoot.position.x;
+          const dz = pointerTarget.z - dogRoot.position.z;
+          const targetAngle = Math.atan2(dx, dz);
+          let angleDiff = targetAngle - dogRoot.rotation.y;
+          while (angleDiff < -Math.PI) angleDiff += Math.PI * 2;
+          while (angleDiff > Math.PI) angleDiff -= Math.PI * 2;
+          const pointerTurn = angleDiff * 0.12;
+          dogRoot.rotation.y = THREE.MathUtils.lerp(dogRoot.rotation.y, idleWobble + pointerTurn, 0.12);
+        } else {
+          dogRoot.rotation.y = THREE.MathUtils.lerp(dogRoot.rotation.y, idleWobble, 0.1);
+        }
         dogRoot.position.y = Math.max(0, breathingBob);
 
         // Body tilt sway
