@@ -64,50 +64,6 @@ html, body {
   outline: none;
 }
 
-/* ── Hand Tracking Webcam Overlay ─────────────────────────────────── */
-.hand-tracking-overlay {
-  position: fixed;
-  right: 24px;
-  bottom: 108px;
-  width: 180px;
-  height: 135px;
-  z-index: 12;
-  background: rgba(9, 9, 11, 0.7);
-  border: 1px solid rgba(255, 255, 255, 0.1);
-  border-radius: 14px;
-  overflow: hidden;
-  backdrop-filter: blur(14px);
-  -webkit-backdrop-filter: blur(14px);
-  box-shadow: 0 20px 50px rgba(0, 0, 0, 0.35);
-  transition: opacity 0.22s ease, visibility 0.22s ease;
-}
-
-.hand-tracking-overlay.hidden {
-  opacity: 0;
-  visibility: hidden;
-  pointer-events: none;
-}
-
-.hand-tracking-label {
-  position: absolute;
-  top: 8px;
-  left: 10px;
-  z-index: 2;
-  font-family: var(--font-mono);
-  font-size: 0.56rem;
-  letter-spacing: 0.12em;
-  color: rgba(244, 244, 245, 0.8);
-}
-
-#hand-video {
-  width: 100%;
-  height: 100%;
-  object-fit: cover;
-  transform: scaleX(-1);
-  filter: saturate(1.2) contrast(1.1);
-  background: #06070a;
-}
-
 /* ── Minimalist Loading Overlay ───────────────────────────────────── */
 #loader-overlay {
   position: fixed;
