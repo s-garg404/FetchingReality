@@ -348,10 +348,14 @@ let catchesCount = 0;
 // Trajectory & Physics Variables
 let throwStartPos   = new THREE.Vector3();
 let throwTargetPos  = new THREE.Vector3();
-let throwProgress   = 0;
 let throwDuration   = 1.2;
-let throwArcHeight  = 2.2;
+const throwVelocity = new THREE.Vector3();
+const previousBallPos = new THREE.Vector3();
 let bounceCount     = 0;
+let ballIsRolling = false;
+const GRAVITY = 9.81;
+const BOUNCE_RESTITUTION = 0.42;
+const GROUND_ROLL_DECELERATION = 4.0;
 
 // Dog navigation
 const dogHomePos    = new THREE.Vector3(0, 0, 0);
@@ -688,12 +692,23 @@ function initiateThrow(targetX, targetZ) {
 
   throwStartPos.copy(ballMesh.position);
   throwTargetPos.set(clampedX, BALL_RADIUS, clampedZ);
-  throwProgress = 0;
   bounceCount = 0;
+  ballIsRolling = false;
 
-  const flightDist = throwStartPos.distanceTo(throwTargetPos);
-  throwDuration = Math.max(0.8, Math.min(2.0, flightDist * 0.18));
-  throwArcHeight = Math.max(1.2, Math.min(3.5, flightDist * 0.35));
+  // Use a lofted softball release so long throws keep a visible high arc.
+  // The resulting ballistic arc lands at the selected point; later motion is
+  // determined by impact speed, restitution, and ground friction.
+  const horizontalDist = Math.hypot(
+    throwTargetPos.x - throwStartPos.x,
+    throwTargetPos.z - throwStartPos.z
+  );
+  const flightAngle = THREE.MathUtils.degToRad(55);
+  throwDuration = Math.max(0.35, Math.sqrt((2 * horizontalDist * Math.tan(flightAngle)) / GRAVITY));
+  throwVelocity.set(
+    (throwTargetPos.x - throwStartPos.x) / throwDuration,
+    GRAVITY * throwDuration * 0.5,
+    (throwTargetPos.z - throwStartPos.z) / throwDuration
+  );
 
   sfx.throw();
   setGameState(STATE.THROW);
@@ -1003,39 +1018,63 @@ function updateStateMachine(dt, time) {
 
     // ══════════════════════════════════════════════════════════════════════════
     // STATE 2: THROW
-    // Animate ball along parabolic arc toward target coordinate, with bounces
+    // Ballistic flight followed by impact-driven bounces and ground friction.
     // ══════════════════════════════════════════════════════════════════════════
     case STATE.THROW: {
-      throwProgress += dt / throwDuration;
+      previousBallPos.copy(ballMesh.position);
 
-      if (throwProgress < 1.0) {
-        const p = throwProgress;
-        ballMesh.position.x = throwStartPos.x + (throwTargetPos.x - throwStartPos.x) * p;
-        ballMesh.position.z = throwStartPos.z + (throwTargetPos.z - throwStartPos.z) * p;
-        ballMesh.position.y = BALL_RADIUS + 4.0 * throwArcHeight * p * (1.0 - p);
-
-        // Spin ball in air
-        ballMesh.rotation.x += dt * 8.0;
-        ballMesh.rotation.z += dt * 5.0;
-
-        // Dog tracks the ball in flight
-        const angleToBall = Math.atan2(
-          ballMesh.position.x - dogRoot.position.x,
-          ballMesh.position.z - dogRoot.position.z
-        );
-        dogRoot.rotation.y = THREE.MathUtils.lerp(dogRoot.rotation.y, angleToBall, 0.08);
-      } else {
-        if (bounceCount === 0) {
-          sfx.bounce();
-          bounceCount++;
+      if (ballIsRolling) {
+        const horizontalSpeed = Math.hypot(throwVelocity.x, throwVelocity.z);
+        if (horizontalSpeed > 0) {
+          const speedAfterFriction = Math.max(0, horizontalSpeed - GROUND_ROLL_DECELERATION * dt);
+          const speedScale = speedAfterFriction / horizontalSpeed;
+          throwVelocity.x *= speedScale;
+          throwVelocity.z *= speedScale;
+          ballMesh.position.x += throwVelocity.x * dt;
+          ballMesh.position.z += throwVelocity.z * dt;
         }
+        if (Math.hypot(throwVelocity.x, throwVelocity.z) < 0.12) {
+          throwVelocity.set(0, 0, 0);
+          ballMesh.position.y = BALL_RADIUS;
+          setGameState(STATE.FETCH);
+        }
+      } else {
+        throwVelocity.y -= GRAVITY * dt;
+        ballMesh.position.addScaledVector(throwVelocity, dt);
 
-        ballMesh.position.copy(throwTargetPos);
-        ballMesh.position.y = BALL_RADIUS;
+        if (ballMesh.position.y <= BALL_RADIUS && throwVelocity.y < 0) {
+          ballMesh.position.y = BALL_RADIUS;
+          const impactSpeed = -throwVelocity.y;
+          if (bounceCount === 0) sfx.bounce();
+          bounceCount++;
 
-        // Transition to Fetch state
-        setGameState(STATE.FETCH);
+          // A softball loses energy at every ground impact. Once the rebound
+          // is small, keep it on the surface and let ground friction stop it.
+          throwVelocity.y = impactSpeed * BOUNCE_RESTITUTION;
+          throwVelocity.x *= 0.78;
+          throwVelocity.z *= 0.78;
+          if (throwVelocity.y < 1.0) {
+            throwVelocity.y = 0;
+            ballIsRolling = true;
+          }
+        }
       }
+
+      // Rotate by the distance actually traveled so the seams roll with the ball.
+      const travelX = ballMesh.position.x - previousBallPos.x;
+      const travelZ = ballMesh.position.z - previousBallPos.z;
+      const travelDistance = Math.hypot(travelX, travelZ);
+      if (travelDistance > 0) {
+        const rollAxis = new THREE.Vector3(travelZ, 0, -travelX).normalize();
+        ballMesh.rotateOnWorldAxis(rollAxis, travelDistance / BALL_RADIUS);
+      }
+
+      // Dog tracks the ball while it is flying, bouncing, or rolling.
+      const angleToBall = Math.atan2(
+        ballMesh.position.x - dogRoot.position.x,
+        ballMesh.position.z - dogRoot.position.z
+      );
+      dogRoot.rotation.y = THREE.MathUtils.lerp(dogRoot.rotation.y, angleToBall, 0.08);
       break;
     }
 
