@@ -352,10 +352,7 @@ let throwProgress   = 0;
 let throwDuration   = 1.2;
 let throwArcHeight  = 2.2;
 let bounceCount     = 0;
-
-// Dog navigation
-const dogHomePos    = new THREE.Vector3(0, 0, 0);
-let dogSpeed        = 4.5; // units per second
+  let throwRollScale  = 0;
 
 // Interaction & Raycasting
 const raycasterPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0); // Ground plane Y=0
@@ -690,6 +687,7 @@ function initiateThrow(targetX, targetZ) {
   throwTargetPos.set(clampedX, BALL_RADIUS, clampedZ);
   throwProgress = 0;
   bounceCount = 0;
+  throwRollScale = Math.min(1.8, Math.max(0.7, flightDist * 0.12));
 
   const flightDist = throwStartPos.distanceTo(throwTargetPos);
   throwDuration = Math.max(0.8, Math.min(2.0, flightDist * 0.18));
@@ -1008,33 +1006,50 @@ function updateStateMachine(dt, time) {
     case STATE.THROW: {
       throwProgress += dt / throwDuration;
 
-      if (throwProgress < 1.0) {
-        const p = throwProgress;
-        ballMesh.position.x = throwStartPos.x + (throwTargetPos.x - throwStartPos.x) * p;
-        ballMesh.position.z = throwStartPos.z + (throwTargetPos.z - throwStartPos.z) * p;
-        ballMesh.position.y = BALL_RADIUS + 4.0 * throwArcHeight * p * (1.0 - p);
+      if (bounceCount === 0) {
+        if (throwProgress < 1.0) {
+          const p = throwProgress;
+          ballMesh.position.x = throwStartPos.x + (throwTargetPos.x - throwStartPos.x) * p;
+          ballMesh.position.z = throwStartPos.z + (throwTargetPos.z - throwStartPos.z) * p;
+          ballMesh.position.y = BALL_RADIUS + 4.0 * throwArcHeight * p * (1.0 - p);
 
-        // Spin ball in air
-        ballMesh.rotation.x += dt * 8.0;
-        ballMesh.rotation.z += dt * 5.0;
+          // Spin ball in air
+          ballMesh.rotation.x += dt * 8.0;
+          ballMesh.rotation.z += dt * 5.0;
 
-        // Dog tracks the ball in flight
-        const angleToBall = Math.atan2(
-          ballMesh.position.x - dogRoot.position.x,
-          ballMesh.position.z - dogRoot.position.z
-        );
-        dogRoot.rotation.y = THREE.MathUtils.lerp(dogRoot.rotation.y, angleToBall, 0.08);
-      } else {
-        if (bounceCount === 0) {
+          // Dog tracks the ball in flight
+          const angleToBall = Math.atan2(
+            ballMesh.position.x - dogRoot.position.x,
+            ballMesh.position.z - dogRoot.position.z
+          );
+          dogRoot.rotation.y = THREE.MathUtils.lerp(dogRoot.rotation.y, angleToBall, 0.08);
+        } else {
           sfx.bounce();
-          bounceCount++;
+          bounceCount = 1;
+
+          ballMesh.position.copy(throwTargetPos);
+          ballMesh.position.y = BALL_RADIUS;
+          ballMesh.rotation.x = 0;
+          ballMesh.rotation.z = 0;
         }
+      } else {
+        const rollProgress = THREE.MathUtils.clamp((throwProgress - 1.0) / Math.max(0.28, throwDuration * 0.35), 0, 1);
+        const rollDistance = throwRollScale * THREE.MathUtils.smoothstep(0, 1, rollProgress);
+        const travelDir = new THREE.Vector3(
+          throwTargetPos.x - throwStartPos.x,
+          0,
+          throwTargetPos.z - throwStartPos.z
+        ).normalize();
 
-        ballMesh.position.copy(throwTargetPos);
+        ballMesh.position.x = throwTargetPos.x + travelDir.x * rollDistance;
+        ballMesh.position.z = throwTargetPos.z + travelDir.z * rollDistance;
         ballMesh.position.y = BALL_RADIUS;
+        ballMesh.rotation.x += dt * 10.0;
+        ballMesh.rotation.z += dt * 4.0;
 
-        // Transition to Fetch state
-        setGameState(STATE.FETCH);
+        if (rollProgress >= 1.0) {
+          setGameState(STATE.FETCH);
+        }
       }
       break;
     }
