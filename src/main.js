@@ -2,20 +2,25 @@
  * FetchingReality – Modern 3D Fetch Simulation & 2D SDF Novel Graphics Engine
  *
  * Features:
- * 1. Ball Object with realistic 3D physics, cursor tracking & fling mechanics
- * 2. 4-State Fetch Machine:
+ * 1. Animated Dog 3D Model (animated_dog.glb / dog_animation.glb):
+ *    - 'Howl' Animation: Triggers when the user clicks on the dog's tail (or clicks Howl button)
+ *    - 'Bite' Animation: Plays when the dog retrieves the ball, with the ball locking to the dog's mouth
+ *    - 'Walk' Animation: Plays whenever the dog is walking/running (Fetch & Return states)
+ *    - 'Idle' Animation: Preserves gentle procedural axis wobble Math.sin(time) & body breathing
+ * 2. Ball Object with realistic 3D physics, cursor tracking & fling mechanics
+ * 3. 4-State Fetch Machine:
  *    - State 1 (Idle/Wag): Axis sine-wobble Math.sin(time) & body breathing
  *    - State 2 (Throw): Parabolic ballistic trajectory & ground bounces
- *    - State 3 (Fetch): Dog linear interpolation (lerp) toward ball with bounding stride
- *    - State 4 (Return): Ball attached to dog mouth offset, dog returns to center
- * 3. 2D SDF GLSL Novel Graphics Engine:
- *    - Uses OpenCV Distance Transform (dog_sdf.png) + RGBA Cutout (dog_cutout.png)
+ *    - State 3 (Fetch): Dog walks toward ball using lerp with skeletal Walk animation
+ *    - State 4 (Return): Ball attached to dog mouth bone, dog walks back to center
+ * 4. 2D SDF GLSL Novel Graphics Engine:
+ *    - OpenCV Distance Transform (dog_sdf.png) + RGBA Cutout (dog_cutout.png)
  *    - Fragment shader dynamic distance-gradient warp, cursor proximity head squish & sine wag
- * 4. Bespoke, non-vibecoded Minimalist Studio UI & Zero-dependency Web Audio Sound Effects
+ * 5. Bespoke Studio UI & Zero-dependency Web Audio Sound Effects (including Howl audio)
  */
 
 import * as THREE from 'three';
-import { FBXLoader } from 'three/addons/loaders/FBXLoader.js';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
 
@@ -43,6 +48,7 @@ const reticle      = document.getElementById('throw-reticle');
 
 // Buttons
 const btnQuickThrow = document.getElementById('btn-quick-throw');
+const btnHowl       = document.getElementById('btn-howl');
 const btnWireframe  = document.getElementById('btn-toggle-wireframe');
 const btnRotate     = document.getElementById('btn-toggle-rotate');
 const btnResetCam   = document.getElementById('btn-reset-cam');
@@ -109,6 +115,28 @@ class SoundFX {
     gain.connect(this.ctx.destination);
     osc.start(t);
     osc.stop(t + 0.15);
+  }
+  howl() {
+    if (!this.ctx) return;
+    const t = this.ctx.currentTime;
+    const osc = this.ctx.createOscillator();
+    const gain = this.ctx.createGain();
+    osc.type = 'triangle';
+    // Melodic canine howl: pitch sweep up then gradual taper down
+    osc.frequency.setValueAtTime(270, t);
+    osc.frequency.exponentialRampToValueAtTime(540, t + 0.5);
+    osc.frequency.setValueAtTime(540, t + 1.2);
+    osc.frequency.exponentialRampToValueAtTime(290, t + 2.3);
+
+    gain.gain.setValueAtTime(0.001, t);
+    gain.gain.exponentialRampToValueAtTime(0.18, t + 0.3);
+    gain.gain.setValueAtTime(0.18, t + 1.3);
+    gain.gain.exponentialRampToValueAtTime(0.001, t + 2.3);
+
+    osc.connect(gain);
+    gain.connect(this.ctx.destination);
+    osc.start(t);
+    osc.stop(t + 2.3);
   }
   success() {
     if (!this.ctx) return;
@@ -288,22 +316,30 @@ shadowRing.rotation.x = -Math.PI / 2;
 shadowRing.position.y = 0.01;
 scene3D.add(shadowRing);
 
-// ── Dog Model Hierarchy ───────────────────────────────────────────────────────
-// We use a root container for physics & world navigation, while internal child
-// preserves scale, centering and Blender axis correction.
+// ── Dog Model Hierarchy & Animation Rig ───────────────────────────────────────
 const dogRoot = new THREE.Group();
 scene3D.add(dogRoot);
 
 let dogMeshGroup = null;
-let dogMouthOffset = new THREE.Vector3(0, 0.7, 0.9); // relative mouth pickup position
+let dogSkinnedMesh = null;
+let mixer = null;
+const actions = { bite: null, howl: null, walk: null };
+let currentActiveAction = null;
+let isHowling = false;
+
+// Bones
+let mouthBone = null;  // Chin / Nose for ball positioning & biting
+let tailBone = null;   // Tail_Tip / Tail_Base for tail-click raycast detection
+let tailBaseBone = null;
+
 let isWireframe = false;
 
 // ── State Machine Definition ──────────────────────────────────────────────────
 const STATE = {
   IDLE: 'idle',     // State 1: Wobble along axis (Math.sin), waiting for throw
   THROW: 'throw',   // State 2: User threw ball, ball travels ballistic arc
-  FETCH: 'fetch',   // State 3: Dog runs toward ball using lerp
-  RETURN: 'return', // State 4: Dog picked up ball, returns to center
+  FETCH: 'fetch',   // State 3: Dog runs toward ball using lerp + Walk animation
+  RETURN: 'return', // State 4: Dog picked up ball (Bite animation), returns to center
 };
 
 let currentState = STATE.IDLE;
@@ -319,19 +355,17 @@ let bounceCount     = 0;
 
 // Dog navigation
 const dogHomePos    = new THREE.Vector3(0, 0, 0);
-let dogTargetPos    = new THREE.Vector3();
-let dogSpeed        = 4.8; // units per second
-let dogRotAngle     = 0;
+let dogSpeed        = 4.5; // units per second
 
 // Interaction & Raycasting
-const raycaster  = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0); // Ground plane Y=0
-const threeRay   = new THREE.Raycaster();
-const mouseVec   = new THREE.Vector2();
+const raycasterPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0); // Ground plane Y=0
+const threeRay       = new THREE.Raycaster();
+const mouseVec       = new THREE.Vector2();
 const planeIntersect = new THREE.Vector3();
 
 let isDraggingBall = false;
-let isHoveringGround = false;
-let groundCursorPos = new THREE.Vector3(0, 0, 1.5);
+let pointerDownPos = new THREE.Vector2();
+let pointerDownTime = 0;
 
 // ── 2D SDF GLSL Novel Graphics Engine ─────────────────────────────────────────
 const scene2D = new THREE.Scene();
@@ -354,8 +388,7 @@ const dogSDFTex = textureLoader.load('/models/dog_sdf.png', (t) => {
   t.magFilter = THREE.LinearFilter;
 });
 
-// GLSL Fragment Shader implementing distance gradient deformation,
-// cursor proximity squish, ripple waves and sine-warp tail wag
+// GLSL Fragment Shader implementing distance gradient deformation
 const sdfFragmentShader = `
   precision highp float;
   uniform sampler2D u_image;
@@ -372,7 +405,6 @@ const sdfFragmentShader = `
     vec2 p = vUv;
     vec2 m = u_mouse;
 
-    // Sample OpenCV Distance Transform (0..1, 0.5 boundary)
     float sdfRaw = texture2D(u_sdf, p).r;
 
     // Compute distance gradient via finite differences
@@ -393,29 +425,24 @@ const sdfFragmentShader = `
     float ripple = sin(distToMouse * 36.0 - u_time * 8.0) * prox * 0.016;
     vec2 rippleOffset = mouseDir * ripple;
 
-    // 3. Tail wagging sine-warp: tail region oscillates with Math.sin
+    // 3. Tail wagging sine-warp
     float tailWeight = smoothstep(0.7, 0.15, p.x) * (sdfRaw > 0.25 ? 1.0 : 0.0);
     float tailWag = sin(u_time * 7.5 + p.y * 6.0) * tailWeight * 0.038;
     vec2 wagOffset = vec2(0.0, tailWag);
 
-    // Deformed UV coordinates
     vec2 warpedUv = clamp(p - squish - rippleOffset - wagOffset, 0.0, 1.0);
 
     if (u_mode == 0) {
-      // Mode 0: Interactive Dynamic Warp, Squish & Wag
       vec4 col = texture2D(u_image, warpedUv);
-      // Interactive aura when cursor hovers
       float aura = smoothstep(0.06, 0.0, abs(distToMouse - 0.12)) * prox * 0.4;
       col.rgb += vec3(0.74, 0.95, 0.39) * aura * col.a;
       gl_FragColor = col;
     } else if (u_mode == 1) {
-      // Mode 1: OpenCV Distance Transform Heatmap
       float d = texture2D(u_sdf, warpedUv).r;
       vec3 heat = mix(vec3(0.05, 0.05, 0.1), vec3(0.2, 0.8, 0.4), d);
       heat = mix(heat, vec3(0.9, 0.95, 0.3), pow(d, 2.5));
       gl_FragColor = vec4(heat, 1.0);
     } else {
-      // Mode 2: Isocontour Isolines
       float d = texture2D(u_sdf, warpedUv).r;
       float lines = abs(fract(d * 18.0) - 0.5);
       float lineMask = smoothstep(0.12, 0.0, lines);
@@ -452,67 +479,110 @@ sdfMaterial = new THREE.ShaderMaterial({
 const sdfQuad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), sdfMaterial);
 scene2D.add(sdfQuad);
 
-// ── Load 3D Dog FBX ───────────────────────────────────────────────────────────
-loaderBar.style.width = '20%';
-loaderPct.textContent = '20%';
-loaderText.textContent = 'PARSING FBX RIG';
-
-const fallbackTex = textureLoader.load('/models/dog1.png', (t) => {
+// ── Dog Fur Texture Setup ─────────────────────────────────────────────────────
+const dogTexture = textureLoader.load('/models/dog1.png', (t) => {
   t.colorSpace = THREE.SRGBColorSpace;
-  t.flipY = false;
+  t.flipY = true; // Essential: Blender UV coordinate layout requires flipY=true (99.5% accuracy)
+  t.generateMipmaps = true;
+  t.minFilter = THREE.LinearMipmapLinearFilter;
+  t.magFilter = THREE.LinearFilter;
+  t.needsUpdate = true;
+
+  if (dogMeshGroup) {
+    dogMeshGroup.traverse((child) => {
+      if (child.isMesh && child.material) {
+        const mats = Array.isArray(child.material) ? child.material : [child.material];
+        mats.forEach((m) => {
+          m.map = t;
+          m.color.set('#ffffff');
+          m.needsUpdate = true;
+        });
+      }
+    });
+  }
 });
 
-const fbxLoader = new FBXLoader();
-fbxLoader.load(
-  '/models/dog.fbx',
-  (fbx) => {
-    dogMeshGroup = fbx;
+// ── Load Animated 3D Dog Model (GLTF) ─────────────────────────────────────────
+loaderBar.style.width = '20%';
+loaderPct.textContent = '20%';
+loaderText.textContent = 'LOADING ANIMATED MODEL';
 
-    // Check sideways orientation (Blender Z-up vs Three.js Y-up)
-    const preBox = new THREE.Box3().setFromObject(fbx);
-    const preSize = preBox.getSize(new THREE.Vector3());
-    if (preSize.x > preSize.y * 1.4 || preSize.z > preSize.y * 1.4) {
-      fbx.rotation.x = -Math.PI / 2;
-    }
+const gltfLoader = new GLTFLoader();
+const modelUrl = '/models/animated_dog.glb';
 
-    // Material enhancement & textures
-    fbx.traverse((child) => {
-      if (child instanceof THREE.Mesh) {
+gltfLoader.load(
+  modelUrl,
+  (gltf) => {
+    dogMeshGroup = gltf.scene;
+
+    // Set up material with dog1.png texture
+    gltf.scene.traverse((child) => {
+      if (child.isMesh) {
         child.castShadow = true;
         child.receiveShadow = true;
+        if (child.isSkinnedMesh) {
+          dogSkinnedMesh = child;
+        }
 
         const mats = Array.isArray(child.material) ? child.material : [child.material];
         mats.forEach((m) => {
           if (!m) return;
-          if (m.map) {
-            m.map.colorSpace = THREE.SRGBColorSpace;
-          } else {
-            m.map = fallbackTex;
-          }
-          m.roughness = 0.8;
-          m.metalness = 0.05;
+          m.map = dogTexture;
+          m.color.set('#ffffff'); // Reset blue tint from GLB so texture displays natural fur colors
+          m.roughness = 0.75;
+          m.metalness = 0.0;
           m.needsUpdate = true;
         });
       }
     });
 
-    // Normalize scale to ~2.2 units
-    const box = new THREE.Box3().setFromObject(fbx);
+    // Locate essential bones for interaction & animation
+    mouthBone    = gltf.scene.getObjectByName('Chin') || gltf.scene.getObjectByName('Chin_Tip') || gltf.scene.getObjectByName('Nose') || gltf.scene.getObjectByName('Head');
+    tailBone     = gltf.scene.getObjectByName('Tail_Tip') || gltf.scene.getObjectByName('Tail_End');
+    tailBaseBone = gltf.scene.getObjectByName('Tail_Base') || gltf.scene.getObjectByName('Tail_Mid');
+
+    // Scale and place on ground
+    const box = new THREE.Box3().setFromObject(gltf.scene);
     const size = box.getSize(new THREE.Vector3());
     const center = box.getCenter(new THREE.Vector3());
     const maxDim = Math.max(size.x, size.y, size.z);
     const scale = 2.2 / maxDim;
 
-    fbx.scale.setScalar(scale);
-    fbx.position.set(-center.x * scale, -box.min.y * scale, -center.z * scale);
+    gltf.scene.scale.setScalar(scale);
+    // Sit base directly on Y=0
+    gltf.scene.position.set(-center.x * scale, -box.min.y * scale, -center.z * scale);
 
-    dogRoot.add(fbx);
+    dogRoot.add(gltf.scene);
     dogRoot.position.copy(dogHomePos);
 
-    // Compute estimated mouth position from bounding box
-    const scaledBox = new THREE.Box3().setFromObject(dogRoot);
-    const scaledSize = scaledBox.getSize(new THREE.Vector3());
-    dogMouthOffset.set(0, scaledSize.y * 0.45, scaledSize.z * 0.42);
+    // ── Setup Animation Mixer & Actions ─────────────────────────────────────
+    mixer = new THREE.AnimationMixer(gltf.scene);
+
+    gltf.animations.forEach((clip) => {
+      const lower = clip.name.toLowerCase();
+      if (lower.includes('walk')) {
+        actions.walk = mixer.clipAction(clip);
+        actions.walk.setLoop(THREE.LoopRepeat);
+      } else if (lower.includes('bite')) {
+        actions.bite = mixer.clipAction(clip);
+        actions.bite.setLoop(THREE.LoopOnce);
+        actions.bite.clampWhenFinished = false;
+      } else if (lower.includes('howl')) {
+        actions.howl = mixer.clipAction(clip);
+        actions.howl.setLoop(THREE.LoopOnce);
+        actions.howl.clampWhenFinished = false;
+      }
+    });
+
+    // Listen for animation finished events (for Howl & Bite)
+    mixer.addEventListener('finished', (e) => {
+      if (e.action === actions.howl) {
+        isHowling = false;
+        if (currentState === STATE.IDLE) {
+          instructionText.textContent = 'Click anywhere on the field or drag the ball to throw';
+        }
+      }
+    });
 
     loaderBar.style.width = '100%';
     loaderPct.textContent = '100%';
@@ -530,11 +600,34 @@ fbxLoader.load(
     }
   },
   (err) => {
-    console.error('FBX Load Error:', err);
+    console.error('GLTF Load Error:', err);
     loaderText.textContent = 'MODEL LOAD ERROR';
     loaderText.style.color = '#f87171';
   }
 );
+
+// ── Trigger Howl Animation ────────────────────────────────────────────────────
+function triggerHowl() {
+  if (!actions.howl || isHowling) return;
+  isHowling = true;
+
+  // Fade out walk if walking
+  if (actions.walk) actions.walk.fadeOut(0.2);
+
+  // Play Howl animation
+  actions.howl.reset();
+  actions.howl.fadeIn(0.2);
+  actions.howl.play();
+
+  // Play audio howl effect
+  sfx.howl();
+
+  instructionText.textContent = '🐺 Awoooo! Rover is howling at the moon!';
+}
+
+btnHowl.addEventListener('click', () => {
+  triggerHowl();
+});
 
 // ── State Machine Transition Manager ──────────────────────────────────────────
 function setGameState(newState) {
@@ -546,32 +639,47 @@ function setGameState(newState) {
     stateSteps[key].classList.toggle('active', key === newState);
   });
 
-  // Dynamic Instructions
+  // Dynamic Instructions & Animation Transitions
   if (newState === STATE.IDLE) {
-    instructionText.textContent = 'Click anywhere on the field or drag the ball to throw';
+    instructionText.textContent = 'Click anywhere on the field to throw · Or click Rover’s tail to howl!';
     statState.style.color = 'var(--accent-cyan)';
+    // Fade out walk animation
+    if (actions.walk) actions.walk.fadeOut(0.25);
   } else if (newState === STATE.THROW) {
     instructionText.textContent = 'Ball is flying across the field!';
     statState.style.color = 'var(--accent-amber)';
+    if (actions.walk) actions.walk.fadeOut(0.2);
   } else if (newState === STATE.FETCH) {
-    instructionText.textContent = 'Rover is tracking and retrieving the ball...';
+    instructionText.textContent = 'Rover is running to retrieve the ball...';
     statState.style.color = 'var(--accent-lime)';
+    // Start Walk animation
+    if (actions.walk) {
+      actions.walk.reset();
+      actions.walk.fadeIn(0.2);
+      actions.walk.play();
+    }
   } else if (newState === STATE.RETURN) {
     instructionText.textContent = 'Ball secured! Bringing it back to you...';
     statState.style.color = 'var(--accent-emerald)';
+    // Keep Walk animation active
+    if (actions.walk && !actions.walk.isRunning()) {
+      actions.walk.reset();
+      actions.walk.fadeIn(0.15);
+      actions.walk.play();
+    }
   }
 }
 
 // ── Throw Ball Logic ──────────────────────────────────────────────────────────
 function initiateThrow(targetX, targetZ) {
-  // Clamp target coordinates inside playable arena
+  if (isHowling) return;
+
   const clampedX = THREE.MathUtils.clamp(targetX, -14, 14);
   const clampedZ = THREE.MathUtils.clamp(targetZ, -14, 14);
 
   // Avoid throwing right under the dog's feet
   const distFromHome = Math.hypot(clampedX, clampedZ);
   if (distFromHome < 1.5) {
-    // Offset outward if too close
     const angle = Math.atan2(clampedZ, clampedX);
     targetX = Math.cos(angle) * 3.5;
     targetZ = Math.sin(angle) * 3.5;
@@ -590,23 +698,22 @@ function initiateThrow(targetX, targetZ) {
   setGameState(STATE.THROW);
 }
 
-// Quick random toss button
 btnQuickThrow.addEventListener('click', () => {
   const angle = Math.random() * Math.PI * 2;
   const dist = 5.0 + Math.random() * 7.0;
   initiateThrow(Math.cos(angle) * dist, Math.sin(angle) * dist);
 });
 
-// ── Pointer Raycasting & Throw Controls ───────────────────────────────────────
-function updatePointerPlane(e) {
+// ── Pointer Raycasting & Tail-Click Detection ──────────────────────────────────
+function updatePointerRay(e) {
   const rect = canvas.getBoundingClientRect();
   mouseVec.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
   mouseVec.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
 
   threeRay.setFromCamera(mouseVec, camera3D);
-  threeRay.ray.intersectPlane(raycaster, planeIntersect);
+  threeRay.ray.intersectPlane(raycasterPlane, planeIntersect);
 
-  // Update 2D SDF mouse uniforms in 0..1 space
+  // Update 2D SDF mouse uniforms
   mouseSDF.x = (e.clientX - rect.left) / rect.width;
   mouseSDF.y = 1.0 - (e.clientY - rect.top) / rect.height;
   if (sdfMaterial) {
@@ -614,32 +721,73 @@ function updatePointerPlane(e) {
   }
 }
 
+// Check if ray hits the tail area of the dog
+function isClickOnTail(e) {
+  if (!dogRoot || !tailBone) return false;
+  threeRay.setFromCamera(mouseVec, camera3D);
+
+  const intersects = threeRay.intersectObject(dogRoot, true);
+  if (intersects.length > 0) {
+    const hitPoint = intersects[0].point;
+    const tailWorld = new THREE.Vector3();
+    tailBone.getWorldPosition(tailWorld);
+
+    // Distance to tail tip or base
+    const distToTail = hitPoint.distanceTo(tailWorld);
+    if (distToTail < 0.95) return true;
+
+    // Also check rear of dog in local coordinates
+    const localHit = dogRoot.worldToLocal(hitPoint.clone());
+    if (localHit.z < -0.4) return true;
+  }
+  return false;
+}
+
 canvas.addEventListener('pointermove', (e) => {
   updatePointerPlane(e);
 
-  if (activeView === '3d') {
-    // If in IDLE and user is dragging or aiming the ball
-    if (currentState === STATE.IDLE) {
-      if (isDraggingBall) {
-        reticle.style.left = `${e.clientX}px`;
-        reticle.style.top = `${e.clientY}px`;
+  if (activeView === '3d' && currentState === STATE.IDLE) {
+    if (isDraggingBall) {
+      reticle.style.left = `${e.clientX}px`;
+      reticle.style.top = `${e.clientY}px`;
+    } else {
+      // Hover hint for tail
+      if (isClickOnTail(e)) {
+        canvas.style.cursor = 'pointer';
+        instructionText.textContent = '🐾 Click Rover’s tail to make him howl!';
+      } else {
+        canvas.style.cursor = 'default';
+        if (!isHowling) {
+          instructionText.textContent = 'Click anywhere on the field to throw · Or click Rover’s tail to howl!';
+        }
       }
     }
   }
 });
 
+function updatePointerPlane(e) {
+  updatePointerRay(e);
+}
+
 canvas.addEventListener('pointerdown', (e) => {
   if (e.button !== 0) return; // Left click only
   updatePointerPlane(e);
 
-  if (activeView === '3d') {
-    if (currentState === STATE.IDLE) {
-      isDraggingBall = true;
-      controls.enabled = false; // Disable orbit during ball toss drag
-      reticle.classList.remove('hidden');
-      reticle.style.left = `${e.clientX}px`;
-      reticle.style.top = `${e.clientY}px`;
+  pointerDownPos.set(e.clientX, e.clientY);
+  pointerDownTime = performance.now();
+
+  if (activeView === '3d' && currentState === STATE.IDLE) {
+    // If clicked on tail, trigger Howl immediately
+    if (isClickOnTail(e)) {
+      triggerHowl();
+      return;
     }
+
+    isDraggingBall = true;
+    controls.enabled = false;
+    reticle.classList.remove('hidden');
+    reticle.style.left = `${e.clientX}px`;
+    reticle.style.top = `${e.clientY}px`;
   }
 });
 
@@ -649,7 +797,14 @@ window.addEventListener('pointerup', (e) => {
     controls.enabled = true;
     reticle.classList.add('hidden');
 
+    const dragDist = Math.hypot(e.clientX - pointerDownPos.x, e.clientY - pointerDownPos.y);
+
     if (currentState === STATE.IDLE && planeIntersect) {
+      // If user barely moved cursor and clicked the tail, it was already handled or check tail
+      if (dragDist < 8 && isClickOnTail(e)) {
+        triggerHowl();
+        return;
+      }
       initiateThrow(planeIntersect.x, planeIntersect.z);
     }
   }
@@ -694,7 +849,7 @@ btnWireframe.addEventListener('click', () => {
   btnWireframe.classList.toggle('active', isWireframe);
   if (dogMeshGroup) {
     dogMeshGroup.traverse((c) => {
-      if (c instanceof THREE.Mesh) {
+      if (c.isMesh) {
         const mats = Array.isArray(c.material) ? c.material : [c.material];
         mats.forEach((m) => { m.wireframe = isWireframe; });
       }
@@ -739,32 +894,36 @@ function animate() {
   const delta = Math.min(clock.getDelta(), 0.1);
   const time = clock.getElapsedTime();
 
-  // 1. Render 2D SDF Shader if active
+  // 1. Update Skeletal Animation Mixer
+  if (mixer) {
+    mixer.update(delta);
+  }
+
+  // 2. Render 2D SDF Shader if active
   if (activeView === 'sdf') {
     if (sdfMaterial) {
       sdfMaterial.uniforms.u_time.value = time;
     }
     renderer.render(scene2D, camera2D);
   } else {
-    // 2. Orbit Controls Update
+    // 3. Orbit Controls Update
     controls.update();
 
-    // 3. State Machine Update
+    // 4. State Machine Update
     updateStateMachine(delta, time);
 
-    // 4. Update Shadow Decal under Ball
+    // 5. Update Shadow Decal under Ball
     shadowRing.position.x = ballMesh.position.x;
     shadowRing.position.z = ballMesh.position.z;
-    // Scale shadow ring based on ball height
     const shadowScale = Math.max(0.3, 1.0 - (ballMesh.position.y - BALL_RADIUS) * 0.25);
     shadowRing.scale.setScalar(shadowScale);
     shadowRingMat.opacity = Math.max(0.1, 0.45 * shadowScale);
 
-    // 5. Update Telemetry
+    // 6. Update Telemetry
     const ballDist = dogRoot.position.distanceTo(ballMesh.position);
     statDistance.textContent = `${ballDist.toFixed(1)}m`;
 
-    // 6. Render 3D Scene
+    // 7. Render 3D Scene
     renderer.render(scene3D, camera3D);
   }
 
@@ -778,6 +937,18 @@ function animate() {
   }
 }
 
+// ── Helper to Get Live Mouth Position in World Coordinates ────────────────────
+const tempMouthPos = new THREE.Vector3();
+function getLiveMouthWorldPos() {
+  if (mouthBone) {
+    mouthBone.getWorldPosition(tempMouthPos);
+    // Slight forward/down adjustment so ball is nestled comfortably in the jaws
+    const forward = new THREE.Vector3(0, -0.05, 0.18).applyEuler(dogRoot.rotation);
+    return tempMouthPos.add(forward);
+  }
+  return dogRoot.position.clone().add(new THREE.Vector3(0, 0.6, 0.8).applyEuler(dogRoot.rotation));
+}
+
 // ── State Machine Logic ───────────────────────────────────────────────────────
 function updateStateMachine(dt, time) {
   switch (currentState) {
@@ -786,25 +957,29 @@ function updateStateMachine(dt, time) {
     // Rotate or wobble the dog object slightly along its axis using sine waves (Math.sin(time))
     // ══════════════════════════════════════════════════════════════════════════
     case STATE.IDLE: {
-      // Axis wobble using Math.sin(time)
-      const idleWobble = Math.sin(time * 3.2) * 0.08;
-      const breathingBob = Math.sin(time * 6.5) * 0.025;
+      if (!isHowling) {
+        // Natural subtle body breathing & axis wobble
+        const idleWobble = Math.sin(time * 3.2) * 0.08;
+        const breathingBob = Math.sin(time * 6.5) * 0.02;
 
-      dogRoot.rotation.y = THREE.MathUtils.lerp(dogRoot.rotation.y, idleWobble, 0.1);
-      dogRoot.position.y = Math.max(0, breathingBob);
+        dogRoot.rotation.y = THREE.MathUtils.lerp(dogRoot.rotation.y, idleWobble, 0.1);
+        dogRoot.position.y = Math.max(0, breathingBob);
 
-      // Tail wag body sway
-      if (dogMeshGroup) {
-        dogMeshGroup.rotation.z = Math.sin(time * 5.0) * 0.03;
+        // Body tilt sway
+        if (dogMeshGroup) {
+          dogMeshGroup.rotation.z = Math.sin(time * 5.0) * 0.025;
+        }
+      } else {
+        dogRoot.position.y = 0;
+        if (dogMeshGroup) dogMeshGroup.rotation.z = 0;
       }
 
-      // If user is dragging the ball, make the ball follow pointer smoothly
+      // Ball dragging interaction
       if (isDraggingBall && planeIntersect) {
         ballMesh.position.x = THREE.MathUtils.lerp(ballMesh.position.x, planeIntersect.x, 0.2);
         ballMesh.position.z = THREE.MathUtils.lerp(ballMesh.position.z, planeIntersect.z, 0.2);
         ballMesh.position.y = BALL_RADIUS + 0.08;
       } else {
-        // Ball rests waiting near home
         ballMesh.position.y = BALL_RADIUS;
       }
       break;
@@ -818,7 +993,6 @@ function updateStateMachine(dt, time) {
       throwProgress += dt / throwDuration;
 
       if (throwProgress < 1.0) {
-        // Parabolic arc in flight
         const p = throwProgress;
         ballMesh.position.x = throwStartPos.x + (throwTargetPos.x - throwStartPos.x) * p;
         ballMesh.position.z = throwStartPos.z + (throwTargetPos.z - throwStartPos.z) * p;
@@ -828,14 +1002,13 @@ function updateStateMachine(dt, time) {
         ballMesh.rotation.x += dt * 8.0;
         ballMesh.rotation.z += dt * 5.0;
 
-        // Dog watches the ball in flight
+        // Dog tracks the ball in flight
         const angleToBall = Math.atan2(
           ballMesh.position.x - dogRoot.position.x,
           ballMesh.position.z - dogRoot.position.z
         );
         dogRoot.rotation.y = THREE.MathUtils.lerp(dogRoot.rotation.y, angleToBall, 0.08);
       } else {
-        // Ball lands on ground with a realistic bounce
         if (bounceCount === 0) {
           sfx.bounce();
           bounceCount++;
@@ -853,6 +1026,7 @@ function updateStateMachine(dt, time) {
     // ══════════════════════════════════════════════════════════════════════════
     // STATE 3: FETCH
     // Animate the dog toward the ball coordinate using linear interpolation (lerp)
+    // Plays Walk animation while moving, and Bite animation when retrieving the ball
     // ══════════════════════════════════════════════════════════════════════════
     case STATE.FETCH: {
       // Calculate target direction
@@ -862,28 +1036,40 @@ function updateStateMachine(dt, time) {
 
       // Smoothly rotate dog to face the ball
       const targetAngle = Math.atan2(dx, dz);
-      // Shortest angle interpolation
       let angleDiff = targetAngle - dogRoot.rotation.y;
       while (angleDiff < -Math.PI) angleDiff += Math.PI * 2;
       while (angleDiff > Math.PI) angleDiff -= Math.PI * 2;
       dogRoot.rotation.y += angleDiff * Math.min(1.0, 7.0 * dt);
 
-      // Animate dog toward ball coordinate using linear interpolation (lerp)
+      // Linear interpolation (lerp) toward ball
       const step = (dogSpeed * dt) / Math.max(0.001, dist);
       const lerpFactor = Math.min(1.0, step);
       dogRoot.position.x = THREE.MathUtils.lerp(dogRoot.position.x, ballMesh.position.x, lerpFactor);
       dogRoot.position.z = THREE.MathUtils.lerp(dogRoot.position.z, ballMesh.position.z, lerpFactor);
 
-      // Running bounding bounce & gallop wobble
-      const runCycle = time * 13.0;
-      dogRoot.position.y = Math.abs(Math.sin(runCycle)) * 0.14;
-      if (dogMeshGroup) {
-        dogMeshGroup.rotation.z = Math.sin(runCycle) * 0.06;
+      // Ensure Walk animation is active
+      if (actions.walk && !actions.walk.isRunning()) {
+        actions.walk.reset();
+        actions.walk.fadeIn(0.2);
+        actions.walk.play();
       }
 
-      // Check pickup distance
-      if (dist < 0.42) {
+      // Check arrival at ball coordinate
+      if (dist < 0.5) {
+        // Trigger Biting Animation & attach ball to mouth
+        if (actions.bite) {
+          if (actions.walk) actions.walk.fadeOut(0.1);
+          actions.bite.reset();
+          actions.bite.fadeIn(0.1);
+          actions.bite.play();
+        }
+
         sfx.pickup();
+
+        // Snap ball to mouth position
+        const mouthPos = getLiveMouthWorldPos();
+        ballMesh.position.copy(mouthPos);
+
         setGameState(STATE.RETURN);
       }
       break;
@@ -891,12 +1077,12 @@ function updateStateMachine(dt, time) {
 
     // ══════════════════════════════════════════════════════════════════════════
     // STATE 4: RETURN
-    // Have the dog "pick up" the ball (attach ball matrix to dog) and return
+    // Ball attaches to dog's mouth bone, dog walks back to center screen
     // ══════════════════════════════════════════════════════════════════════════
     case STATE.RETURN: {
-      // Attach ball matrix / position to dog mouth front offset
-      const mouthWorld = dogMouthOffset.clone().applyEuler(dogRoot.rotation).add(dogRoot.position);
-      ballMesh.position.copy(mouthWorld);
+      // Keep ball attached to dog's live mouth bone position
+      const mouthPos = getLiveMouthWorldPos();
+      ballMesh.position.copy(mouthPos);
 
       // Calculate path back to origin center screen
       const dx = dogHomePos.x - dogRoot.position.x;
@@ -916,16 +1102,16 @@ function updateStateMachine(dt, time) {
       dogRoot.position.x = THREE.MathUtils.lerp(dogRoot.position.x, dogHomePos.x, lerpFactor);
       dogRoot.position.z = THREE.MathUtils.lerp(dogRoot.position.z, dogHomePos.z, lerpFactor);
 
-      // Return running bounding bounce
-      const runCycle = time * 12.0;
-      dogRoot.position.y = Math.abs(Math.sin(runCycle)) * 0.12;
-      if (dogMeshGroup) {
-        dogMeshGroup.rotation.z = Math.sin(runCycle) * 0.05;
+      // Ensure Walk animation is active while returning
+      if (actions.walk && !actions.walk.isRunning()) {
+        actions.walk.reset();
+        actions.walk.fadeIn(0.15);
+        actions.walk.play();
       }
 
       // Reached center screen
-      if (dist < 0.3) {
-        // Drop ball in front of dog
+      if (dist < 0.35) {
+        // Drop ball in front of dog on the ground
         ballMesh.position.set(dogHomePos.x, BALL_RADIUS, dogHomePos.z + 1.4);
         dogRoot.position.copy(dogHomePos);
         dogRoot.rotation.y = 0;
@@ -934,6 +1120,9 @@ function updateStateMachine(dt, time) {
         catchesCount++;
         statCatches.textContent = `${catchesCount}`;
         sfx.success();
+
+        // Fade out walk animation
+        if (actions.walk) actions.walk.fadeOut(0.25);
 
         setGameState(STATE.IDLE);
       }
