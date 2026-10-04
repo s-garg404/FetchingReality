@@ -52,10 +52,23 @@ const btnHowl       = document.getElementById('btn-howl');
 const btnWireframe  = document.getElementById('btn-toggle-wireframe');
 const btnRotate     = document.getElementById('btn-toggle-rotate');
 const btnResetCam   = document.getElementById('btn-reset-cam');
+const btnEnableCam  = document.getElementById('btn-enable-camera');
 const btnMode3D     = document.getElementById('btn-mode-3d');
 const btnModeSDF    = document.getElementById('btn-mode-sdf');
 const sdfToolbar    = document.getElementById('sdf-toolbar');
 const sdfModeBtns   = document.querySelectorAll('.sdf-mode-btn');
+const handVideo     = document.getElementById('hand-video');
+const handTrackingOverlay = document.getElementById('hand-tracking-overlay');
+
+const handTracking = {
+  x: 0.5,
+  y: 0.5,
+  active: false,
+  confidence: 0,
+};
+
+let handLandmarker = null;
+let handTrackingLoopActive = false;
 
 // ── Web Audio Synthesizer (Zero-dependency tactile sound effects) ───────────────
 class SoundFX {
@@ -157,6 +170,107 @@ class SoundFX {
 }
 const sfx = new SoundFX();
 window.addEventListener('pointerdown', () => sfx.init(), { once: true });
+
+async function initHandTracking() {
+  if (handLandmarker || handTrackingLoopActive) {
+    return;
+  }
+
+  const isSecureContext = window.isSecureContext || location.hostname === 'localhost' || location.hostname === '127.0.0.1';
+
+  if (!navigator.mediaDevices?.getUserMedia || !window.vision || !isSecureContext) {
+    instructionText.textContent = 'Camera access requires a real browser tab on localhost/https. Open this page in Chrome or Edge, not an embedded preview.';
+    return;
+  }
+
+  try {
+    handTrackingLoopActive = true;
+    const { HandLandmarker, FilesetResolver } = window.vision;
+    if (!HandLandmarker || !FilesetResolver) {
+      throw new Error('MediaPipe vision library not available');
+    }
+
+    const vision = await FilesetResolver.forVisionTasks(
+      'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.22/wasm'
+    );
+
+    handLandmarker = await HandLandmarker.createFromOptions(vision, {
+      baseOptions: {
+        modelAssetPath: 'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task',
+        delegate: 'GPU',
+      },
+      runningMode: 'VIDEO',
+      numHands: 1,
+    });
+
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: {
+        facingMode: 'user',
+        width: { ideal: 640 },
+        height: { ideal: 480 },
+      },
+      audio: false,
+    });
+
+    handVideo.srcObject = stream;
+    handVideo.onloadedmetadata = () => {
+      handVideo.play().catch(() => {});
+      handTrackingOverlay.classList.remove('hidden');
+    };
+
+    const detectHands = () => {
+      if (!handLandmarker || !handVideo.videoWidth || !handVideo.videoHeight) {
+        requestAnimationFrame(detectHands);
+        return;
+      }
+
+      const result = handLandmarker.detectForVideo(handVideo, performance.now());
+      const firstHand = result.landmarks?.[0];
+
+      if (firstHand) {
+        const indexTip = firstHand[8];
+        handTracking.x = THREE.MathUtils.clamp(indexTip.x, 0, 1);
+        handTracking.y = THREE.MathUtils.clamp(indexTip.y, 0, 1);
+        handTracking.active = true;
+        handTracking.confidence = result.handedness?.[0]?.[0]?.score ?? 0.9;
+      } else {
+        handTracking.active = false;
+      }
+
+      requestAnimationFrame(detectHands);
+    };
+
+    requestAnimationFrame(detectHands);
+  } catch (error) {
+    console.warn('Hand tracking unavailable:', error);
+    const message = error?.name === 'NotAllowedError'
+      ? 'Camera permission was blocked. Open the site in a normal Chrome/Edge tab and allow camera access.'
+      : error?.name === 'NotFoundError'
+        ? 'No webcam was found. Plug one in or select a working camera in Chrome settings.'
+        : 'Camera startup failed. Open this page in a normal browser tab over localhost and allow access.';
+
+    instructionText.textContent = message;
+    handTracking.active = false;
+    handTrackingLoopActive = false;
+  }
+}
+
+async function enableHandTracking() {
+  if (!handTrackingLoopActive) {
+    instructionText.textContent = 'Allow camera access, then move your hand in front of the webcam.';
+    await initHandTracking();
+  }
+}
+
+btnEnableCam?.addEventListener('click', () => {
+  enableHandTracking();
+});
+
+window.addEventListener('pointerdown', () => {
+  if (!handTrackingLoopActive) {
+    enableHandTracking();
+  }
+}, { once: true });
 
 // ── Renderer Setup ────────────────────────────────────────────────────────────
 const renderer = new THREE.WebGLRenderer({
@@ -961,17 +1075,29 @@ function updateStateMachine(dt, time) {
         // Natural subtle body breathing & axis wobble
         const idleWobble = Math.sin(time * 3.2) * 0.08;
         const breathingBob = Math.sin(time * 6.5) * 0.02;
+        const handYaw = handTracking.active ? (handTracking.x - 0.5) * 1.8 : 0;
+        const handPitch = handTracking.active ? (0.5 - handTracking.y) * 1.2 : 0;
 
-        dogRoot.rotation.y = THREE.MathUtils.lerp(dogRoot.rotation.y, idleWobble, 0.1);
+        dogRoot.rotation.y = THREE.MathUtils.lerp(
+          dogRoot.rotation.y,
+          idleWobble + handYaw,
+          handTracking.active ? 0.16 : 0.1
+        );
         dogRoot.position.y = Math.max(0, breathingBob);
 
-        // Body tilt sway
+        // Body tilt sway with camera-driven head pitch tracking
         if (dogMeshGroup) {
-          dogMeshGroup.rotation.z = Math.sin(time * 5.0) * 0.025;
+          const bodySway = Math.sin(time * 5.0) * 0.025;
+          const headTilt = bodySway - handPitch;
+          dogMeshGroup.rotation.z = THREE.MathUtils.lerp(dogMeshGroup.rotation.z, bodySway, 0.1);
+          dogMeshGroup.rotation.x = THREE.MathUtils.lerp(dogMeshGroup.rotation.x, headTilt, handTracking.active ? 0.14 : 0.08);
         }
       } else {
         dogRoot.position.y = 0;
-        if (dogMeshGroup) dogMeshGroup.rotation.z = 0;
+        if (dogMeshGroup) {
+          dogMeshGroup.rotation.x = THREE.MathUtils.lerp(dogMeshGroup.rotation.x, 0, 0.12);
+          dogMeshGroup.rotation.z = 0;
+        }
       }
 
       // Ball dragging interaction
