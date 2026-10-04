@@ -20,6 +20,7 @@
  */
 
 import * as THREE from 'three';
+import { HandLandmarker, FilesetResolver } from '@mediapipe/tasks-vision';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
@@ -178,20 +179,16 @@ async function initHandTracking() {
 
   const isSecureContext = window.isSecureContext || location.hostname === 'localhost' || location.hostname === '127.0.0.1';
 
-  if (!navigator.mediaDevices?.getUserMedia || !window.vision || !isSecureContext) {
+  if (!navigator.mediaDevices?.getUserMedia || !isSecureContext) {
     instructionText.textContent = 'Camera access requires a real browser tab on localhost/https. Open this page in Chrome or Edge, not an embedded preview.';
     return;
   }
 
   try {
     handTrackingLoopActive = true;
-    const { HandLandmarker, FilesetResolver } = window.vision;
-    if (!HandLandmarker || !FilesetResolver) {
-      throw new Error('MediaPipe vision library not available');
-    }
 
     const vision = await FilesetResolver.forVisionTasks(
-      'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.22/wasm'
+      'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.21/wasm'
     );
 
     handLandmarker = await HandLandmarker.createFromOptions(vision, {
